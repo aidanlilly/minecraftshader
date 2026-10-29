@@ -7,9 +7,6 @@ const bool shadowcolor0Nearest = true;
 const int   shadowMapResolution = 2048;
 const float shadowDistanceRenderMul = 1.0;
 
-#define SHADOW_RANGE   4
-#define SHADOW_RADIUS  1.0
-
 // Coordinate transformations
 vec3 distortShadowClipPos(vec3 shadowClipPos) {
     float radialDistance = length(shadowClipPos.xy);

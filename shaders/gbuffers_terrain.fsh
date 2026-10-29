@@ -16,11 +16,11 @@ layout(location = 1) out vec4 lightmapData;
 layout(location = 2) out vec4 encodedNormal;
 
 void main() {
-	color = texture(gtexture, texcoord) * glcolor; // biome tint
+	color = texture(gtexture, texcoord) * glcolor;
 	if (color.a < alphaTestRef) {
 		discard;
 	}
 
 	lightmapData = vec4(lmcoord, 0.0, 1.0);
-encodedNormal = vec4(normal * 0.5 + 0.5, 0.0); // .a = 0.0 = not water, no SSR
+	encodedNormal = vec4(normal * 0.5 + 0.5, 0.0);
 }

@@ -13,6 +13,6 @@ void main() {
 	lmcoord = (gl_TextureMatrix[1] * gl_MultiTexCoord1).xy;
 	glcolor = gl_Color;
 
-	normal = gl_NormalMatrix * gl_Normal; // this gives us the normal in view space
-	normal = mat3(gbufferModelViewInverse) * normal; // this converts the normal to world/player space
+	normal = gl_NormalMatrix * gl_Normal;
+	normal = mat3(gbufferModelViewInverse) * normal;
 }

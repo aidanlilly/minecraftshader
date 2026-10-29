@@ -18,7 +18,6 @@ void main() {
     color = texture(gtexture, texcoord) * glcolor;
     if (color.a < alphaTestRef) discard;
 
-    // Full lighting done here — don't rely on composite
     color.rgb *= texture(lightmap, lmcoord).rgb;
 
     lightmapData  = vec4(lmcoord, 1.0, 1.0);

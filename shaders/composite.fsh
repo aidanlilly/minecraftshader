@@ -27,22 +27,21 @@ in vec2 texcoord;
 /* RENDERTARGETS: 0 */
 layout(location = 0) out vec4 color;
 
-// Configuration constants
-// Shadows
-#define SHADOW_RANGE   2
-#define SHADOW_RADIUS  2.0
-#define SHADOW_RES     2048.0
-
-// Ambient Occlusion (AO)
-#define AO_SAMPLES     16
-#define AO_RADIUS      0.5
-
-// Screen Space Reflections (SSR)
+// Screen-space reflection settings
 #define SSR_STEPS      80       // Maximum ray-march iterations
 #define SSR_BIN_STEPS  8        // Binary refinement steps
 #define SSR_MAXDIST    32.0     // Maximum ray length in world units
 #define SSR_THICKNESS  0.5      // Surface intersection tolerance depth
 #define SSR_EDGE_FADE  0.1      // Screen edge vignette fade factor (0.0 - 0.5)
+
+#define SHADOW_RANGE   2
+#define SHADOW_RADIUS  2.0
+
+// Screen-space ambient occlusion
+#define SSAO_SAMPLES   12
+#define SSAO_RADIUS    0.65     // Keep the effect local so foliage does not get broadly darkened
+#define SSAO_BIAS      0.035    // Avoid self-occlusion on nearly coplanar surfaces
+#define SSAO_STRENGTH  0.5      // Subtle contact shading without making grass stand out
 
 // Material coefficients (Water)
 #define WATER_F0       0.05     // Base specular reflectance at normal incidence
@@ -64,13 +63,63 @@ vec3 unproject(mat4 invProjection, vec3 ndc) {
     return hyperSpacePos.xyz / hyperSpacePos.w;
 }
 
-vec4 sampleNoise(vec2 uv) {
+float sampleNoise(vec2 uv) {
     ivec2 texelCoords = ivec2(uv * vec2(viewWidth, viewHeight)) % 64;
-    return texelFetch(noisetex, texelCoords, 0);
+    return texelFetch(noisetex, texelCoords, 0).r;
+}
+
+// Estimate local occlusion by testing projected hemisphere samples against the depth buffer.
+float getScreenSpaceAO(vec2 uv, vec3 viewPosition, vec3 worldNormal) {
+    vec3 viewNormal = normalize(transpose(mat3(gbufferModelViewInverse)) * worldNormal);
+
+    // Build a stable tangent frame, with a per-pixel rotation to hide the sample pattern.
+    vec3 helper = abs(viewNormal.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(helper, viewNormal));
+    vec3 bitangent = cross(viewNormal, tangent);
+    float rotation = sampleNoise(uv) * 6.2831853;
+    mat2 rotationMatrix = mat2(cos(rotation), -sin(rotation), sin(rotation), cos(rotation));
+
+    float occlusion = 0.0;
+    float validSamples = 0.0;
+    for (int i = 0; i < SSAO_SAMPLES; i++) {
+        // Fibonacci-like hemisphere directions, with more samples near the surface.
+        float fi = float(i) + 0.5;
+        float z = (fi / float(SSAO_SAMPLES));
+        float angle = fi * 2.39996323;
+        vec2 disk = vec2(cos(angle), sin(angle)) * sqrt(1.0 - z * z);
+        disk = rotationMatrix * disk;
+        float radialScale = mix(0.2, 1.0, fi / float(SSAO_SAMPLES));
+        vec3 sampleDirection = normalize(tangent * disk.x + bitangent * disk.y + viewNormal * z);
+        vec3 samplePosition = viewPosition + sampleDirection * (SSAO_RADIUS * radialScale);
+
+        vec4 sampleClip = gbufferProjection * vec4(samplePosition, 1.0);
+        if (sampleClip.w <= 0.0) continue;
+        vec2 sampleUV = sampleClip.xy / sampleClip.w * 0.5 + 0.5;
+        if (any(lessThan(sampleUV, vec2(0.001))) || any(greaterThan(sampleUV, vec2(0.999)))) continue;
+
+        float sampleDepth = texture(depthtex0, sampleUV).r;
+        if (sampleDepth >= 1.0) continue;
+        vec3 scenePosition = unproject(gbufferProjectionInverse,
+            vec3(sampleUV * 2.0 - 1.0, sampleDepth * 2.0 - 1.0));
+
+        // View space looks down -Z. A surface in front of the hemisphere sample occludes it.
+        float separation = scenePosition.z - samplePosition.z;
+        float sampleDistance = length(scenePosition - viewPosition);
+        float rangeWeight = 1.0 - smoothstep(SSAO_RADIUS * 0.5, SSAO_RADIUS * 2.0, sampleDistance);
+        occlusion += step(SSAO_BIAS, separation) * rangeWeight;
+        validSamples += 1.0;
+    }
+
+    float obscurance = validSamples > 0.0 ? occlusion / validSamples : 0.0;
+    return clamp(1.0 - obscurance * SSAO_STRENGTH, 0.0, 1.0);
 }
 
 // Shadow mapping
 vec3 sampleShadowMap(vec3 shadowSpacePos) {
+    if (any(lessThan(shadowSpacePos, vec3(0.0))) || any(greaterThan(shadowSpacePos, vec3(1.0)))) {
+        return vec3(1.0);
+    }
+
     float bias = 0.001;
     float depthOpaque = texture(shadowtex0, shadowSpacePos.xy).r;
     float depthTransparent = texture(shadowtex1, shadowSpacePos.xy).r;
@@ -87,14 +136,16 @@ vec3 sampleShadowMap(vec3 shadowSpacePos) {
 }
 
 vec3 getSoftShadow(vec4 shadowClip) {
-    float angle = sampleNoise(texcoord).r * 6.2831853;
+    if (shadowClip.w <= 0.0) return vec3(1.0);
+
+    float angle = sampleNoise(texcoord) * 6.2831853;
     mat2  rotationMatrix = mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
     vec3  shadowAccumulator = vec3(0.0);
     int   sampleCount = 0;
     
     for (int x = -SHADOW_RANGE; x <= SHADOW_RANGE; x++) {
         for (int y = -SHADOW_RANGE; y <= SHADOW_RANGE; y++) {
-            vec2 offset = rotationMatrix * (vec2(x, y) * (SHADOW_RADIUS / SHADOW_RES));
+            vec2 offset = rotationMatrix * (vec2(x, y) * (SHADOW_RADIUS / float(shadowMapResolution)));
             vec3 ndc = shadowClip.xyz / shadowClip.w;
             ndc.xy += offset;
             ndc = distortShadowClipPos(ndc);
@@ -106,39 +157,11 @@ vec3 getSoftShadow(vec4 shadowClip) {
     return shadowAccumulator / float(sampleCount);
 }
 
-// Ambient occlusion
-float getAO(vec3 viewPos, vec3 viewNormal) {
-    float occlusion = 0.0;
-    float baseAngle = sampleNoise(texcoord).r * 6.2831853;
-    
-    for (int i = 0; i < AO_SAMPLES; i++) {
-        float sampleIdx = float(i) + 0.5;
-        float radius = AO_RADIUS * sampleIdx / float(AO_SAMPLES);
-        float angle = baseAngle + sampleIdx * 2.3999632;
-        
-        vec2 sampleUV = texcoord + vec2(cos(angle), sin(angle)) * radius / vec2(viewWidth, viewHeight);
-        if (sampleUV != clamp(sampleUV, 0.0, 1.0)) continue;
-        
-        float sampleDepth = texture(depthtex0, sampleUV).r;
-        if (sampleDepth == 1.0) continue;
-        
-        vec3 sampleViewPos = unproject(gbufferProjectionInverse, vec3(sampleUV * 2.0 - 1.0, sampleDepth * 2.0 - 1.0));
-        vec3 positionDelta = sampleViewPos - viewPos;
-        float distanceDelta = length(positionDelta);
-        
-        if (distanceDelta < 0.0001) continue;
-        
-        occlusion += (1.0 - max(0.0, dot(viewNormal, positionDelta / distanceDelta))) *
-                     clamp(1.0 - distanceDelta / AO_RADIUS, 0.0, 1.0);
-    }
-    return clamp(occlusion / float(AO_SAMPLES), 0.0, 1.0);
-}
-
 // Screen space reflections
 vec2 traceSSR(vec3 viewPos, vec3 reflectDir, out float hitFade) {
     hitFade = 0.0;
 
-    float jitter = sampleNoise(texcoord).b;
+    float jitter = sampleNoise(texcoord);
     float stepLength = SSR_MAXDIST / float(SSR_STEPS);
     vec3 rayPosition = viewPos + reflectDir * stepLength * (0.5 + jitter * 0.5);
 
@@ -146,6 +169,7 @@ vec2 traceSSR(vec3 viewPos, vec3 reflectDir, out float hitFade) {
         rayPosition += reflectDir * stepLength;
 
         vec4 clipSpacePos = gbufferProjection * vec4(rayPosition, 1.0);
+        if (clipSpacePos.w <= 0.0) break;
         vec2 uv = clipSpacePos.xy / clipSpacePos.w * 0.5 + 0.5;
 
         if (uv != clamp(uv, 0.001, 0.999)) break;
@@ -166,7 +190,15 @@ vec2 traceSSR(vec3 viewPos, vec3 reflectDir, out float hitFade) {
                 for (int b = 0; b < SSR_BIN_STEPS; b++) {
                     vec3 midPoint = (rayRangeMin + rayRangeMax) * 0.5;
                     vec4 midClip = gbufferProjection * vec4(midPoint, 1.0);
+                    if (midClip.w <= 0.0) {
+                        rayRangeMin = midPoint;
+                        continue;
+                    }
                     vec2 midUV = midClip.xy / midClip.w * 0.5 + 0.5;
+                    if (any(lessThan(midUV, vec2(0.001))) || any(greaterThan(midUV, vec2(0.999)))) {
+                        rayRangeMin = midPoint;
+                        continue;
+                    }
                     
                     float midDepthVal = texture(depthtex0, midUV).r;
                     vec3 midSurfacePos = unproject(gbufferProjectionInverse, vec3(midUV * 2.0 - 1.0, midDepthVal * 2.0 - 1.0));
@@ -184,9 +216,8 @@ vec2 traceSSR(vec3 viewPos, vec3 reflectDir, out float hitFade) {
                 
                 if (refinedUV != clamp(refinedUV, 0.0, 1.0)) break;
 
-                // Edge and Distance Attenuation Calculating
-                vec2 edgeAttenuation = smoothstep(0.0, SSR_EDGE_FADE, refinedUV) *
-                                       smoothstep(1.0, 1.0 - SSR_EDGE_FADE, refinedUV);
+                vec2 edgeAttenuation = smoothstep(vec2(0.0), vec2(SSR_EDGE_FADE), refinedUV) *
+                                       (1.0 - smoothstep(vec2(1.0 - SSR_EDGE_FADE), vec2(1.0), refinedUV));
                 float distanceAttenuation = 1.0 - clamp(length(refinedRayPos - viewPos) / SSR_MAXDIST, 0.0, 1.0);
 
                 hitFade = edgeAttenuation.x * edgeAttenuation.y * distanceAttenuation;
@@ -222,10 +253,10 @@ float getWaterFresnel(vec3 viewDir, vec3 viewNormal) {
 // Main executable entrypoint
 void main() {
     color = texture(colortex0, texcoord);
-    color.rgb = pow(color.rgb, vec3(2.2)); // Gamma Correction: Convert to linear space
+    color.rgb = pow(color.rgb, vec3(2.2));
 
     float sceneDepth = texture(depthtex0, texcoord).r;
-    if (sceneDepth == 1.0) return; // Early Exit: Background sky environment
+    if (sceneDepth == 1.0) return;
 
     vec4 normalData = texture(colortex2, texcoord);
     vec3 surfaceNormal = normalize(normalData.rgb * 2.0 - 1.0);
@@ -233,7 +264,7 @@ void main() {
 
     vec2 lightmapCoords = texture(colortex1, texcoord).rg;
     float handGeometryMask = texture(colortex1, texcoord).b;
-    if (handGeometryMask > 0.5) return; // Early Exit: View-model pass optimization
+    if (handGeometryMask > 0.5) return;
 
     vec3 lightDirection = normalize(shadowLightPosition);
     vec3 worldLightDirection = mat3(gbufferModelViewInverse) * lightDirection;
@@ -251,7 +282,9 @@ void main() {
     vec3 lightBlock = lightmapCoords.x * blocklightColor;
     vec3 lightSky = lightmapCoords.y * skylightColor;
 
-    color.rgb *= (lightBlock + lightSky + ambientColor + lightSun);
+    float ambientOcclusion = getScreenSpaceAO(texcoord, viewPosition, surfaceNormal);
+    vec3 indirectLight = (lightBlock + lightSky + ambientColor) * ambientOcclusion;
+    color.rgb *= (indirectLight + lightSun);
 
     // Material Interaction: Water Surface Layer
     if (waterMask > 0.5 && isEyeInWater == 0) {
