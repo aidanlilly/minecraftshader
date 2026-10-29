@@ -1,4 +1,4 @@
-# Minecraft Shader Pack
+# Softbound Shader Pack
 
 A work-in-progress Minecraft shader pack written in GLSL. The pack adds custom lighting and post-processing effects, with a focus on soft shadows, contact shading, and reflective water.
 
